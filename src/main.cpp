@@ -33,6 +33,7 @@ static uint8_t g_screen_rotation = 0;  // 0-3 = steps of 90° clockwise from TFT
 // ── Extra Fonts ──────────────────────────────────────────────────────────────
 LV_FONT_DECLARE(lv_font_fa_extra_icons)
 #define FA_INFO_ICON "\xEF\x81\x9A"
+#define FA_SEARCH_ICON "\xEF\x80\x82"
 
 // ── Line data ────────────────────────────────────────────────────────────────
 #define NUM_LINES      20
@@ -128,6 +129,7 @@ static lv_obj_t *g_ssid_ta           = nullptr;
 static lv_obj_t *g_pwd_ta            = nullptr;
 static lv_obj_t *g_wifi_status_lbl   = nullptr;
 static bool      g_wifi_was_connected = false;
+static lv_obj_t *g_wifi_scan_overlay = nullptr;
 
 // ── Forward declarations ────────────────────────────────────────────────
 static void navigate_to(ScreenType type, int line_idx = 0);
@@ -987,6 +989,138 @@ static void wifi_connect_and_save() {
     }
 }
 
+static void close_wifi_scan_overlay() {
+    if (g_wifi_scan_overlay) {
+        lv_obj_delete(g_wifi_scan_overlay);
+        g_wifi_scan_overlay = nullptr;
+    }
+}
+
+// Full-screen dimmed overlay that hosts either the "scanning" spinner or the
+// results panel; only one is ever alive at a time, tracked by g_wifi_scan_overlay.
+static lv_obj_t *build_scan_overlay(lv_obj_t *scr) {
+    lv_obj_t *overlay = lv_obj_create(scr);
+    lv_obj_set_size(overlay, TFT_HOR_RES, TFT_VER_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, C(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_radius(overlay, 0, 0);
+    lv_obj_set_style_pad_all(overlay, 0, 0);
+    lv_obj_remove_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    g_wifi_scan_overlay = overlay;
+    return overlay;
+}
+
+static void show_wifi_scan_results(lv_obj_t *scr, int16_t n) {
+    close_wifi_scan_overlay();
+    lv_obj_t *overlay = build_scan_overlay(scr);
+
+    lv_obj_t *panel = lv_obj_create(overlay);
+    lv_obj_set_size(panel, TFT_HOR_RES - 40, 360);
+    lv_obj_align(panel, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_bg_color(panel, C(0x14181E), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, C(0x2A3038), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_radius(panel, 12, 0);
+    lv_obj_set_style_pad_all(panel, 12, 0);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, n > 0 ? "Select a network" : (n == 0 ? "No networks found" : "Scan failed"));
+    lv_obj_set_style_text_color(title, C(0xE6E8EB), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t *list = lv_list_create(panel);
+    lv_obj_set_size(list, TFT_HOR_RES - 64, 360 - 24 - 44 - 56);
+    lv_obj_set_pos(list, 0, 40);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+
+    char seen_ssids[24][33];
+    int  seen_count = 0;
+    for (int i = 0; i < n && seen_count < 24; i++) {
+        String ssid_s = WiFi.SSID(i);
+        if (ssid_s.length() == 0) continue;
+        bool dup = false;
+        for (int j = 0; j < seen_count; j++) {
+            if (strcmp(seen_ssids[j], ssid_s.c_str()) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        strncpy(seen_ssids[seen_count], ssid_s.c_str(), 32);
+        seen_ssids[seen_count][32] = '\0';
+        seen_count++;
+
+        char row_text[80];
+        bool open_net = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+        snprintf(row_text, sizeof(row_text), "%s%s", ssid_s.c_str(), open_net ? "  (open)" : "");
+
+        lv_obj_t *btn = lv_list_add_button(list, LV_SYMBOL_WIFI, row_text);
+        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
+        char *ssid_copy = strdup(ssid_s.c_str());
+        lv_obj_set_user_data(btn, ssid_copy);
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            lv_obj_t *b = static_cast<lv_obj_t *>(lv_event_get_target(e));
+            const char *s = static_cast<const char *>(lv_obj_get_user_data(b));
+            if (g_ssid_ta && s) lv_textarea_set_text(g_ssid_ta, s);
+            close_wifi_scan_overlay();
+            if (g_pwd_ta && g_wifi_keyboard) {
+                lv_keyboard_set_textarea(g_wifi_keyboard, g_pwd_ta);
+                lv_obj_remove_flag(g_wifi_keyboard, LV_OBJ_FLAG_HIDDEN);
+            }
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            free(lv_obj_get_user_data(static_cast<lv_obj_t *>(lv_event_get_target(e))));
+        }, LV_EVENT_DELETE, nullptr);
+    }
+
+    lv_obj_t *cancel_btn = lv_button_create(panel);
+    lv_obj_set_size(cancel_btn, TFT_HOR_RES - 64, 44);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, C(0x2A3038), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, C(0xE6E8EB), 0);
+    lv_obj_align(cancel_lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_event_cb(cancel_btn, [](lv_event_t *) { close_wifi_scan_overlay(); }, LV_EVENT_CLICKED, nullptr);
+
+    WiFi.scanDelete();
+}
+
+static void wifi_start_scan(lv_obj_t *scr) {
+    if (g_wifi_scan_overlay) return;  // scan already in progress / results shown
+
+    if (g_wifi_keyboard) lv_obj_add_flag(g_wifi_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *overlay = build_scan_overlay(scr);
+    lv_obj_t *spinner = lv_spinner_create(overlay);
+    lv_obj_set_size(spinner, 50, 50);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_arc_color(spinner, C(0x39B57C), LV_PART_INDICATOR);
+    lv_obj_t *lbl = lv_label_create(overlay);
+    lv_label_set_text(lbl, "Scanning for networks...");
+    lv_obj_set_style_text_color(lbl, C(0xE6E8EB), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 40);
+    lv_timer_handler();  // render spinner before the blocking poll loop below
+
+    int16_t result = WiFi.scanNetworks(true /*async*/, false /*show_hidden*/);
+    uint32_t start = millis();
+    while (result == WIFI_SCAN_RUNNING && millis() - start < 10000) {
+        lv_timer_handler();
+        delay(50);
+        result = WiFi.scanComplete();
+    }
+
+    // The overlay may have been dismissed (e.g. by re-navigating) while the
+    // scan was running; only render results if it's still the active screen.
+    if (g_wifi_scan_overlay) show_wifi_scan_results(scr, result);
+}
+
 // ── WiFi config screen ────────────────────────────────────────────────────
 static void build_wifi_config(lv_obj_t *scr) {
     g_wifi_keyboard   = nullptr;
@@ -1010,10 +1144,12 @@ static void build_wifi_config(lv_obj_t *scr) {
     lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_pos(ssid_lbl, 20, 68);
 
+    const int ssid_ta_w = TFT_HOR_RES - 40 - 48 - 8;  // leave room for the scan button
+
     lv_obj_t *ssid_ta = lv_textarea_create(scr);
     lv_obj_set_pos(ssid_ta, 20, 86);
     lv_textarea_set_one_line(ssid_ta, true);
-    lv_obj_set_size(ssid_ta, TFT_HOR_RES - 40, 48);
+    lv_obj_set_size(ssid_ta, ssid_ta_w, 48);
     lv_textarea_set_placeholder_text(ssid_ta, "Enter network name");
     lv_textarea_set_text(ssid_ta, g_wifi_ssid);
     lv_obj_set_style_bg_color(ssid_ta, C(0x14181E), 0);
@@ -1026,6 +1162,24 @@ static void build_wifi_config(lv_obj_t *scr) {
     lv_obj_set_style_text_font(ssid_ta, &lv_font_montserrat_14, 0);
     lv_obj_set_style_pad_hor(ssid_ta, 12, 0);
     lv_obj_set_style_pad_ver(ssid_ta, 15, 0);
+
+    lv_obj_t *scan_btn = lv_button_create(scr);
+    lv_obj_set_pos(scan_btn, 20 + ssid_ta_w + 8, 86);
+    lv_obj_set_size(scan_btn, 48, 48);
+    lv_obj_set_style_bg_color(scan_btn, C(0x14181E), 0);
+    lv_obj_set_style_bg_opa(scan_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(scan_btn, C(0x2A3038), 0);
+    lv_obj_set_style_border_width(scan_btn, 1, 0);
+    lv_obj_set_style_radius(scan_btn, 8, 0);
+    lv_obj_set_style_pad_all(scan_btn, 0, 0);
+    lv_obj_t *scan_icon = lv_label_create(scan_btn);
+    lv_label_set_text(scan_icon, FA_SEARCH_ICON);
+    lv_obj_set_style_text_font(scan_icon, &lv_font_fa_extra_icons, 0);
+    lv_obj_set_style_text_color(scan_icon, C(0x39B57C), 0);
+    lv_obj_align(scan_icon, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_event_cb(scan_btn, [](lv_event_t *) {
+        wifi_start_scan(lv_screen_active());
+    }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *pwd_lbl = lv_label_create(scr);
     lv_label_set_text(pwd_lbl, "Password");
@@ -1263,6 +1417,7 @@ static void navigate_to(ScreenType type, int line_idx) {
     g_ssid_ta         = nullptr;
     g_pwd_ta          = nullptr;
     g_wifi_status_lbl = nullptr;
+    g_wifi_scan_overlay = nullptr;
     if (type != SCREEN_HOME) g_home_page = 0;
 
     lv_obj_t *old_scr = lv_screen_active();

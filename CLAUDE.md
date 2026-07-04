@@ -59,6 +59,14 @@ Credentials are stored in NVS via the ESP32 `Preferences` library (namespace `"w
 - On boot, if saved credentials exist, `WiFi.begin()` is called in the background; no blocking wait.
 - `WiFi.h` and `Preferences.h` are part of the ESP32 Arduino core.
 
+### Network scan-and-select
+
+A search-icon button next to the SSID field on the Wi-Fi settings screen lets the user pick a visible network instead of typing its name (some SSIDs are awkward to enter on the on-screen keyboard). The icon (`FA_SEARCH_ICON`, codepoint `0xf002`) comes from `src/fonts/lv_font_fa_extra_icons.c`, the same FontAwesome-subset font used for `FA_INFO_ICON` on the About row — regenerate it with `lv_font_conv` (see the file header comment for the exact command) if more codepoints are ever needed.
+
+- `wifi_start_scan()` — shows a dimmed full-screen spinner overlay, then runs `WiFi.scanNetworks(true, ...)` (async) and pumps `lv_timer_handler()` in a poll loop (up to 10 s) until `WiFi.scanComplete()` returns, matching the same blocking-with-UI-pump pattern used by `wifi_connect_and_save()`.
+- `show_wifi_scan_results()` — replaces the spinner with a scrollable `lv_list` of de-duplicated SSIDs (open networks tagged `(open)`); tapping one fills the SSID textarea and opens the keyboard on the password field. A Cancel button dismisses the overlay without changing the SSID.
+- `g_wifi_scan_overlay` tracks the overlay so `navigate_to()` can null it out (it's a child of the screen being torn down) and so repeat taps of the scan button while a scan/result overlay is already showing are ignored.
+
 ## TfL API
 
 `fetch_tfl_status()` calls the live TfL Unified API:
