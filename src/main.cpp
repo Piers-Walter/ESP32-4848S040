@@ -27,6 +27,8 @@
 static Arduino_ESP32SPI   *bus;
 static Arduino_RGB_Display *gfx;
 static uint8_t *draw_buf = nullptr;  // PSRAM-allocated in setup()
+static lv_display_t *g_disp = nullptr;
+static uint8_t g_screen_rotation = 0;  // 0-3 = steps of 90° clockwise from TFT_ROTATION; persisted in NVS
 
 // ── Extra Fonts ──────────────────────────────────────────────────────────────
 LV_FONT_DECLARE(lv_font_fa_extra_icons)
@@ -862,6 +864,48 @@ static void load_line_prefs() {
         line_enabled[i] = (mask >> i) & 1;
 }
 
+// ── Screen rotation ─────────────────────────────────────────────────────
+// Index 0 is the factory default orientation (gfx rotation 3 / TFT_ROTATION).
+// Each increment rotates 90° further clockwise.
+//
+// lv_conf.h has LV_DRAW_TRANSFORM_USE_MATRIX / LV_USE_MATRIX disabled, so
+// LVGL's own render pipeline never rotates pixel content — lv_display_set_rotation()
+// only affects touch-point remapping (lv_display_rotate_point(), called
+// unconditionally from LVGL's indev handling) and the hor/ver-res getters.
+// The actual on-screen rotation comes entirely from gfx->setRotation(), which
+// re-maps each flushed bitmap into the physical framebuffer (see
+// Arduino_RGB_Display::draw16bitRGBBitmap). Confirmed on hardware: gfx's
+// rotation index and LVGL's touch-remap rotation step in opposite directions,
+// so as gfx steps clockwise (index+1), the touch remap must step the other
+// way (index-1) to keep landing on the same visual position.
+static const uint8_t GFX_ROTATION_BASE = 3;
+static const lv_display_rotation_t SCREEN_ROTATIONS[4] = {
+    LV_DISPLAY_ROTATION_90, LV_DISPLAY_ROTATION_0, LV_DISPLAY_ROTATION_270, LV_DISPLAY_ROTATION_180,
+};
+static const char *const SCREEN_ROTATION_LABELS[4] = { "0°", "90°", "180°", "270°" };
+
+static void apply_screen_rotation(uint8_t idx) {
+    g_screen_rotation = idx & 3;
+    gfx->setRotation((GFX_ROTATION_BASE + g_screen_rotation) % 4);
+    lv_display_set_rotation(g_disp, SCREEN_ROTATIONS[g_screen_rotation]);
+    lv_obj_t *scr = lv_screen_active();
+    if (scr) lv_obj_invalidate(scr);
+}
+
+static void save_screen_rotation() {
+    Preferences prefs;
+    prefs.begin("display", false);
+    prefs.putUChar("rot", g_screen_rotation);
+    prefs.end();
+}
+
+static void load_screen_rotation() {
+    Preferences prefs;
+    prefs.begin("display", true);
+    g_screen_rotation = prefs.getUChar("rot", 0) & 3;
+    prefs.end();
+}
+
 static void load_wifi_credentials() {
     Preferences prefs;
     prefs.begin("wifi", true);
@@ -1164,6 +1208,44 @@ static void build_settings(lv_obj_t *scr) {
         lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -16, 0);
         lv_obj_remove_flag(chev, LV_OBJ_FLAG_CLICKABLE);
     }
+
+    // Rotate-screen row: acts immediately on tap instead of navigating away.
+    lv_obj_t *rot_row = lv_button_create(scr);
+    lv_obj_set_size(rot_row, TFT_HOR_RES - 24, 64);
+    lv_obj_set_pos(rot_row, 12, 68 + 3 * 72);
+    lv_obj_set_style_bg_color(rot_row, C(0x14181E), 0);
+    lv_obj_set_style_bg_opa(rot_row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rot_row, 0, 0);
+    lv_obj_set_style_radius(rot_row, 10, 0);
+    lv_obj_set_style_pad_all(rot_row, 0, 0);
+    lv_obj_remove_flag(rot_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *rot_icon = lv_label_create(rot_row);
+    lv_label_set_text(rot_icon, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_color(rot_icon, C(0x9AA3AD), 0);
+    lv_obj_set_style_text_font(rot_icon, &lv_font_montserrat_16, 0);
+    lv_obj_align(rot_icon, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_remove_flag(rot_icon, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *rot_lbl = lv_label_create(rot_row);
+    lv_label_set_text(rot_lbl, "Rotate Screen");
+    lv_obj_set_style_text_color(rot_lbl, C(0xE6E8EB), 0);
+    lv_obj_set_style_text_font(rot_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(rot_lbl, LV_ALIGN_LEFT_MID, 46, 0);
+    lv_obj_remove_flag(rot_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *rot_deg = lv_label_create(rot_row);
+    lv_label_set_text(rot_deg, SCREEN_ROTATION_LABELS[g_screen_rotation]);
+    lv_obj_set_style_text_color(rot_deg, C(0x6E7681), 0);
+    lv_obj_set_style_text_font(rot_deg, &lv_font_montserrat_16, 0);
+    lv_obj_align(rot_deg, LV_ALIGN_RIGHT_MID, -16, 0);
+    lv_obj_remove_flag(rot_deg, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_add_event_cb(rot_row, [](lv_event_t *e) {
+        apply_screen_rotation(g_screen_rotation + 1);
+        save_screen_rotation();
+        lv_label_set_text((lv_obj_t *)lv_event_get_user_data(e), SCREEN_ROTATION_LABELS[g_screen_rotation]);
+    }, LV_EVENT_CLICKED, rot_deg);
 }
 
 // ── Navigation ───────────────────────────────────────────────────────────
@@ -1500,10 +1582,11 @@ void setup() {
     lv_init();
     lv_tick_set_cb(my_tick);
 
-    lv_display_t *disp = lv_display_create(TFT_HOR_RES, TFT_VER_RES);
-    lv_display_set_flush_cb(disp, my_disp_flush);
-    lv_display_set_buffers(disp, draw_buf, nullptr, DRAW_BUF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_rotation(disp, TFT_ROTATION);
+    g_disp = lv_display_create(TFT_HOR_RES, TFT_VER_RES);
+    lv_display_set_flush_cb(g_disp, my_disp_flush);
+    lv_display_set_buffers(g_disp, draw_buf, nullptr, DRAW_BUF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    load_screen_rotation();
+    apply_screen_rotation(g_screen_rotation);
 
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);

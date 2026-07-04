@@ -19,7 +19,7 @@ Screens navigate via touch:
 |--------|-------------|
 | **Home** | Dynamic grid sorted severe → minor → good. Layout chosen by enabled-line count: 1→1×1, 2→1×2, 3–4→2×2, 5–6→3×2, 7–9→3×3, 10+→4×3 (with paging). Badge size scales with layout (70–160 px). Page dots at bottom when multi-page. Header shows clock + last-updated. |
 | **Detail** | Large roundel badge, status pill, full disruption text for a single line. |
-| **Settings** | Menu with three items: Lines, Wi-Fi, About. |
+| **Settings** | Menu with items: Lines, Wi-Fi, About, and a "Rotate Screen" row that rotates the whole UI 90° clockwise on each tap (for mounting the device in any orientation). |
 | **Settings → Lines** | Toggle which lines appear on the home grid. All/None shortcuts. |
 | **Settings → About** | App name, "Powered by TfL Open Data" attribution, TfL Open Data URL. |
 
@@ -38,6 +38,17 @@ Which lines are shown on the home grid is stored in NVS via the `Preferences` li
 
 - `save_line_prefs()` — packs `line_enabled[]` into a 32-bit bitmask and writes it. Called immediately on any toggle change (individual row, ALL, NONE).
 - `load_line_prefs()` — reads the bitmask back and restores `line_enabled[]`. Called in `setup()` after the default all-enabled initialisation. If no key exists yet (first boot) the defaults are kept.
+
+## Screen rotation persistence
+
+The "Rotate Screen" row on the Settings menu steps through the 4 cardinal orientations (0°/90°/180°/270°), stored in NVS via `Preferences` (namespace `"display"`, key `"rot"`).
+
+- `lv_conf.h` has `LV_DRAW_TRANSFORM_USE_MATRIX` / `LV_USE_MATRIX` disabled, so LVGL's own render pipeline **never** rotates pixel content — `lv_display_set_rotation()` only affects touch-point remapping (`lv_display_rotate_point()`, called unconditionally from LVGL's indev handling) and the hor/ver-res getters. The actual visual rotation comes entirely from `gfx->setRotation()` (Arduino_GFX re-maps each flushed bitmap into the physical framebuffer — see `Arduino_RGB_Display::draw16bitRGBBitmap`).
+- `apply_screen_rotation(idx)` steps `gfx->setRotation((GFX_ROTATION_BASE + idx) % 4)` for the visual rotation, and `lv_display_set_rotation(g_disp, SCREEN_ROTATIONS[idx])` so touch input still lands where the user visually tapped. It then invalidates the active screen to force gfx to re-blit the whole framebuffer in the new orientation.
+- **Confirmed on hardware: `gfx`'s rotation index and LVGL's touch-remap rotation step in opposite directions.** `gfx` steps clockwise as `idx` increases (`GFX_ROTATION_BASE + idx`); `SCREEN_ROTATIONS[]` therefore steps the *other* way (`{90, 0, 270, 180}`, i.e. index component effectively `1 - idx mod 4`) so touch tracks the visual rotation instead of fighting it. 0°/180° happen to be direction-agnostic (a 180° rotation is its own inverse), which is why a same-direction pairing looked correct there but was off by 180° at the 90°/270° steps until this fix.
+- The touch driver's own rotation (`ts.setRotation()` in `touch.h`) stays fixed at `TOUCH_GT911_ROTATION` — it's calibrated to match `gfx`'s native wiring; `lv_display_rotate_point()` handles the rest per-orientation.
+- `save_screen_rotation()` / `load_screen_rotation()` persist/restore the index; `load_screen_rotation()` is called in `setup()` right before the initial `apply_screen_rotation()`.
+- Because the panel is 480×480, rotation never changes `hor_res`/`ver_res`, so no layout needs to change — only the pixel/touch coordinate mapping.
 
 ## WiFi credential persistence
 
